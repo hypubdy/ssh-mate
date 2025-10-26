@@ -164,16 +164,19 @@ program
         fs.writeFileSync(keyFile, keyContent + '\n', { mode: 0o600 });
         try {
           fs.chmodSync(keyFile, 0o600);
-          console.log(`🔑 Đã lưu key vào: ${keyFile}`);
+          console.log(`🔑 Đã lưu key vào: ~/.sshm/keys/${answers.name}_key`);
         } catch (e) {
           console.log('⚠️ Không thể set quyền 600 cho file key');
         }
         
-        server.keyPath = keyFile;
+        server.keyPath = `~/.sshm/keys/${answers.name}_key`;
       } else if (answers.keyMethod === 'file') {
-        server.keyPath = answers.keyPath.replace(/^~(?=$|\/)/, os.homedir());
-        if (!fs.existsSync(server.keyPath)) {
-          console.log(`⚠️ Không tìm thấy file key: ${server.keyPath}`);
+        // Lưu đường dẫn với ~/
+        server.keyPath = answers.keyPath;
+        // Kiểm tra file tồn tại bằng đường dẫn đầy đủ
+        const fullKeyPath = answers.keyPath.replace(/^~(?=$|\/)/, os.homedir());
+        if (!fs.existsSync(fullKeyPath)) {
+          console.log(`⚠️ Không tìm thấy file key: ${answers.keyPath}`);
           return;
         }
       } else {
@@ -198,7 +201,15 @@ program
   .action(() => {
     const servers = getServers();
     if (servers.length === 0) return console.log('⚠️ Chưa có server nào.');
-    console.table(servers);
+    
+    // Hiển thị chỉ thông tin auth type
+    const authInfo = servers.map(server => ({
+      name: server.name,
+      host: server.host,
+      auth: server.keyPath ? 'SSH Key' : 'Password'
+    }));
+    
+    console.table(authInfo);
   });
 
 program
@@ -229,8 +240,9 @@ program
     // delete key file if it is inside ~/.sshm/keys
     try {
       const keysDir = path.join(os.homedir(), '.sshm', 'keys');
-      if (removed.keyPath && removed.keyPath.startsWith(keysDir) && fs.existsSync(removed.keyPath)) {
-        fs.unlinkSync(removed.keyPath);
+      const fullKeyPath = removed.keyPath ? removed.keyPath.replace(/^~(?=$|\/)/, os.homedir()) : null;
+      if (fullKeyPath && fullKeyPath.startsWith(keysDir) && fs.existsSync(fullKeyPath)) {
+        fs.unlinkSync(fullKeyPath);
       }
     } catch (e) { /* ignore */ }
 
