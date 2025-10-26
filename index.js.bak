@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * sshm-cli - simple Node CLI to store ssh credentials in OS keyring and auto-login
+ * sshmate-cli - simple Node CLI to store ssh credentials in OS keyring and auto-login
  *
  * Usage:
- *   sshm add
- *   sshm list
- *   sshm remove <alias>
- *   sshm connect <alias>
- *   sshm <alias>
+ *   sshmate add
+ *   sshmate list
+ *   sshmate remove <alias>
+ *   sshmate connect <alias>
  *
  * Notes:
  *  - Requires: ssh available in PATH
@@ -23,8 +22,10 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { getServers, saveServers, savePassword, getPassword, deletePassword } from './lib/store.js';
 
+const program = new Command();
+
 // Function to handle SSH connection
-async function handleSSH(name) {
+const handleSSH = async (name) => {
   const servers = getServers();
   if (servers.length === 0) return console.log('⚠️ Chưa có server nào.');
 
@@ -39,8 +40,8 @@ async function handleSSH(name) {
     // expand ~ to home
     const keyPath = server.keyPath.replace(/^~(?=$|\/)/, os.homedir());
     if (!fs.existsSync(keyPath)) return console.log(`⚠️ Không tìm thấy file key: ${keyPath}`);
-    console.log(`🔐 Đang kết nối bằng SSH key tới ${server.user}@${server.host}:${server.port}...`);
-    // console.log(`🔑 Sử dụng SSH key: ${keyPath}`);
+    console.log(`🔐 Đang kết nối bằng SSH key tới ${server.user}@${server.host}...`);
+    console.log(`🔑 Sử dụng SSH key: ${keyPath}`);
     const ssh = spawn('ssh', [
       '-o', 'StrictHostKeyChecking=no',
       '-o', 'UserKnownHostsFile=/dev/null',
@@ -58,9 +59,9 @@ async function handleSSH(name) {
   }
 
   const password = await getPassword(name);
+
   if (!password) return console.log('⚠️ Không tìm thấy password đã lưu.');
-  
-  console.log(`🔐 Đang kết nối tới ${server.user}@${server.host}:${server.port}...`);
+  console.log(`🔐 Đang kết nối tới ${server.user}@${server.host}...`);
   const sshPassProc = spawn('sshpass', [
     '-p', password,
     'ssh',
@@ -77,12 +78,10 @@ async function handleSSH(name) {
     console.log(`🔌 Đã thoát khỏi SSH với mã: ${code}`);
     process.exit(code);
   });
-}
-
-const program = new Command();
+};
 
 program
-  .name('sshm')
+  .name('sshmate')
   .description('CLI quản lý và SSH nhanh vào server')
   .version('1.0.0')
   .argument('[name]', 'Tên server để kết nối trực tiếp')
@@ -116,18 +115,9 @@ program
         default: 'password'
       },
       { type: 'password', name: 'password', message: 'Mật khẩu SSH:', when: a => a.auth === 'password' },
-      {
-        type: 'list',
-        name: 'keyMethod',
-        message: 'Cách nhập key:',
-        when: a => a.auth === 'key',
-        choices: [
-          { name: 'Dùng file key có sẵn', value: 'file' },
-          { name: 'Dán nội dung key', value: 'paste' }
-        ]
-      },
-      { type: 'input', name: 'keyPath', message: 'Đường dẫn private key:', default: '~/.ssh/id_rsa', when: a => a.auth === 'key' && a.keyMethod === 'file' },
-      { type: 'editor', name: 'keyContent', message: 'Dán nội dung private key vào đây (Ctrl+S để lưu, Ctrl+Q để thoát):', when: a => a.auth === 'key' && a.keyMethod === 'paste' }
+      { type: 'list', name: 'keyMethod', message: 'Cách cung cấp key:', choices: [{name: 'Đường dẫn file', value: 'path'}, {name: 'Dán nội dung key', value: 'paste'}], when: a => a.auth === 'key' },
+      { type: 'input', name: 'keyPath', message: 'Đường dẫn private key:', default: '~/.ssh/id_rsa', when: a => a.auth === 'key' && a.keyMethod === 'path' },
+      { type: 'editor', name: 'keyContent', message: 'Dán private key vào (sẽ mở editor):', when: a => a.auth === 'key' && a.keyMethod === 'paste' }
     ]);
 
     const servers = getServers();
@@ -135,53 +125,25 @@ program
       name: answers.name,
       host: answers.host,
       user: answers.user,
-      port: answers.port || '22'
+      port: answers.port || '22'  // Đảm bảo luôn có giá trị mặc định là 22
     };
-
     if (answers.auth === 'key') {
-      if (answers.keyMethod === 'paste' && answers.keyContent) {
-        // write pasted key content to a secure file under ~/.sshm/keys
-        const keysDir = path.join(os.homedir(), '.sshm', 'keys');
-        if (!fs.existsSync(keysDir)) {
-          fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
-        }
-        
+      if (answers.keyMethod === 'paste') {
+        // write pasted key content to a secure file under ~/.sshmate/keys
+        const keysDir = path.join(os.homedir(), '.sshmate', 'keys');
+        if (!fs.existsSync(keysDir)) fs.mkdirSync(keysDir, { recursive: true });
         const keyFile = path.join(keysDir, `${answers.name}_key`);
-        
-        // Validate key content
-        const keyContent = answers.keyContent.trim();
-        if (!keyContent) {
-          console.log('⚠️ Không có nội dung key. Hủy.');
-          return;
+        // ensure content exists
+        if (!answers.keyContent || !answers.keyContent.trim()) {
+          return console.log('⚠️ Không có nội dung key. Hủy.');
         }
-        
-        if (!keyContent.includes('PRIVATE KEY')) {
-          console.log('⚠️ Nội dung không phải private key hợp lệ. Hủy.');
-          return;
-        }
-        
-        // Write key with proper permissions
-        fs.writeFileSync(keyFile, keyContent + '\n', { mode: 0o600 });
-        try {
-          fs.chmodSync(keyFile, 0o600);
-          console.log(`🔑 Đã lưu key vào: ${keyFile}`);
-        } catch (e) {
-          console.log('⚠️ Không thể set quyền 600 cho file key');
-        }
-        
+        fs.writeFileSync(keyFile, answers.keyContent + (answers.keyContent.endsWith('\n') ? '' : '\n'), { mode: 0o600 });
+        try { fs.chmodSync(keyFile, 0o600); } catch (e) { /* ignore on platforms that don't support */ }
         server.keyPath = keyFile;
-      } else if (answers.keyMethod === 'file') {
-        server.keyPath = answers.keyPath.replace(/^~(?=$|\/)/, os.homedir());
-        if (!fs.existsSync(server.keyPath)) {
-          console.log(`⚠️ Không tìm thấy file key: ${server.keyPath}`);
-          return;
-        }
       } else {
-        console.log('⚠️ Thiếu thông tin key SSH. Hủy.');
-        return;
+        server.keyPath = answers.keyPath.replace(/^~(?=$|\/)/, os.homedir());
       }
     }
-
     servers.push(server);
     saveServers(servers);
 
@@ -193,11 +155,10 @@ program
   });
 
 program
-  .command('list')
+  .command('ls')
   .description('Liệt kê danh sách server')
   .action(() => {
     const servers = getServers();
-    if (servers.length === 0) return console.log('⚠️ Chưa có server nào.');
     console.table(servers);
   });
 
@@ -226,9 +187,9 @@ program
     // delete password if any
     try { await deletePassword(removed.name); } catch (e) { /* ignore */ }
 
-    // delete key file if it is inside ~/.sshm/keys
+    // delete key file if it is inside ~/.sshmate/keys
     try {
-      const keysDir = path.join(os.homedir(), '.sshm', 'keys');
+      const keysDir = path.join(os.homedir(), '.sshmate', 'keys');
       if (removed.keyPath && removed.keyPath.startsWith(keysDir) && fs.existsSync(removed.keyPath)) {
         fs.unlinkSync(removed.keyPath);
       }
@@ -258,6 +219,48 @@ program
     }
 
     await handleSSH(targetName);
+      // expand ~ to home
+      const keyPath = server.keyPath.replace(/^~(?=$|\/)/, os.homedir());
+      if (!fs.existsSync(keyPath)) return console.log(`⚠️ Không tìm thấy file key: ${keyPath}`);
+      console.log(`🔐 Đang kết nối bằng SSH key tới ${server.user}@${server.host}...`);
+      console.log(`🔑 Sử dụng SSH key: ${keyPath}`);
+      const ssh = spawn('ssh', [
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'LogLevel=ERROR',
+        '-p', server.port,
+        '-i', keyPath,
+        `${server.user}@${server.host}`
+      ], { stdio: 'inherit' });
+
+      ssh.on('exit', code => {
+        console.log(`🔌 Đã thoát khỏi SSH với mã: ${code}`);
+        process.exit(code);
+      });
+      return;
+    }
+
+    const password = await getPassword(name);
+
+    if (!password) return console.log('⚠️ Không tìm thấy password đã lưu.');
+    console.log(`🔐 Đang kết nối tới ${server.user}@${server.host}...`);
+    // Dùng sshpass + spawn để ssh tự động
+    const sshPassProc = spawn('sshpass', [
+      '-p', password,
+      'ssh',
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-o', 'LogLevel=ERROR',
+      '-p', server.port,
+      `${server.user}@${server.host}`
+    ], {
+      stdio: 'inherit'
+    });
+
+    sshPassProc.on('exit', code => {
+      console.log(`🔌 Đã thoát khỏi SSH với mã: ${code}`);
+      process.exit(code);
+    });
   });
 
 program.parseAsync();
