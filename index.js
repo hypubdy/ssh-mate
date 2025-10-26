@@ -23,6 +23,17 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { getServers, saveServers, savePassword, getPassword, deletePassword, saveKeyContent, regenerateKeyFile, regenerateAllKeyFiles } from './lib/store.js';
 
+// Check if sshpass is available
+function checkSshpass() {
+  return new Promise((resolve) => {
+    const check = spawn('which', ['sshpass'], { stdio: 'ignore' });
+    check.on('close', (code) => {
+      resolve(code === 0);
+    });
+    check.on('error', () => resolve(false));
+  });
+}
+
 // Function to handle SSH connection
 async function handleSSH(name) {
   const servers = getServers();
@@ -100,23 +111,60 @@ async function handleSSH(name) {
   const password = await getPassword(name);
   if (!password) return console.log('⚠️ Không tìm thấy password đã lưu.');
   
+  // Check if sshpass is available
+  const hasSshpass = await checkSshpass();
+  if (!hasSshpass) {
+    console.log('❌ sshpass không được tìm thấy. Vui lòng cài đặt:');
+    console.log('   Ubuntu/Debian: sudo apt install sshpass');
+    console.log('   CentOS/RHEL: sudo yum install sshpass');
+    console.log('   macOS: brew install sshpass');
+    console.log('   Hoặc sử dụng SSH key thay vì password');
+    return;
+  }
+  
   console.log(`🔐 Đang kết nối tới ${server.user}@${server.host}:${server.port}...`);
-  const sshPassProc = spawn('sshpass', [
-    '-p', password,
-    'ssh',
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', 'UserKnownHostsFile=/dev/null',
-    '-o', 'LogLevel=ERROR',
-    '-p', server.port,
-    `${server.user}@${server.host}`
-  ], {
-    stdio: 'inherit'
-  });
+  
+  try {
+    const sshPassProc = spawn('sshpass', [
+      '-p', password,
+      'ssh',
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-o', 'LogLevel=ERROR',
+      '-p', server.port,
+      `${server.user}@${server.host}`
+    ], {
+      stdio: 'inherit'
+    });
 
-  sshPassProc.on('exit', code => {
-    console.log(`🔌 Đã thoát khỏi SSH với mã: ${code}`);
-    process.exit(code);
-  });
+    sshPassProc.on('error', (error) => {
+      if (error.code === 'ENOENT') {
+        console.log('❌ sshpass không được tìm thấy. Vui lòng cài đặt:');
+        console.log('   Ubuntu/Debian: sudo apt install sshpass');
+        console.log('   CentOS/RHEL: sudo yum install sshpass');
+        console.log('   macOS: brew install sshpass');
+        console.log('   Hoặc sử dụng SSH key thay vì password');
+      } else {
+        console.log(`❌ Lỗi SSH: ${error.message}`);
+      }
+      process.exit(1);
+    });
+
+    sshPassProc.on('exit', code => {
+      if (code === 0) {
+        console.log(`🔌 Đã thoát khỏi SSH thành công`);
+      } else {
+        console.log(`🔌 SSH connection failed với mã: ${code}`);
+        if (code === 255) {
+          console.log(`💡 Gợi ý: Kiểm tra lại thông tin server hoặc password`);
+        }
+      }
+      process.exit(code);
+    });
+  } catch (error) {
+    console.log(`❌ Lỗi khi khởi tạo SSH: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 const program = new Command();
