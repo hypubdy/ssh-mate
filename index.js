@@ -21,7 +21,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { getServers, saveServers, savePassword, getPassword, deletePassword } from './lib/store.js';
+import { getServers, saveServers, savePassword, getPassword, deletePassword, saveKeyContent, regenerateKeyFile, regenerateAllKeyFiles } from './lib/store.js';
 
 // Function to handle SSH connection
 async function handleSSH(name) {
@@ -37,8 +37,41 @@ async function handleSSH(name) {
   // If server has keyPath, use SSH key; otherwise fall back to password
   if (server.keyPath) {
     // expand ~ to home
-    const keyPath = server.keyPath.replace(/^~(?=$|\/)/, os.homedir());
-    if (!fs.existsSync(keyPath)) return console.log(`⚠️ Không tìm thấy file key: ${keyPath}`);
+    let keyPath = server.keyPath.replace(/^~(?=$|\/)/, os.homedir());
+    
+    // If key file doesn't exist, try to regenerate it from stored content
+    if (!fs.existsSync(keyPath)) {
+      console.log(`⚠️ Không tìm thấy file key: ${keyPath}`);
+      console.log(`🔄 Đang thử tái tạo key file...`);
+      try {
+        keyPath = await regenerateKeyFile(name);
+        keyPath = keyPath.replace(/^~(?=$|\/)/, os.homedir());
+        if (!fs.existsSync(keyPath)) {
+          return console.log(`⚠️ Không thể tái tạo key file cho server: ${name}`);
+        }
+      } catch (error) {
+        return console.log(`⚠️ ${error.message}`);
+      }
+    }
+    
+    // Validate key file before using
+    try {
+      const keyContent = fs.readFileSync(keyPath, 'utf8');
+      if (!keyContent.includes('BEGIN') || !keyContent.includes('PRIVATE KEY')) {
+        console.log(`⚠️ Key file không hợp lệ: ${keyPath}`);
+        console.log(`🔄 Đang thử tái tạo key file...`);
+        try {
+          keyPath = await regenerateKeyFile(name);
+          keyPath = keyPath.replace(/^~(?=$|\/)/, os.homedir());
+        } catch (error) {
+          return console.log(`⚠️ Không thể tái tạo key file: ${error.message}`);
+        }
+      }
+    } catch (e) {
+      console.log(`⚠️ Không thể đọc key file: ${keyPath}`);
+      return;
+    }
+    
     console.log(`🔐 Đang kết nối bằng SSH key tới ${server.user}@${server.host}:${server.port}...`);
     // console.log(`🔑 Sử dụng SSH key: ${keyPath}`);
     const ssh = spawn('ssh', [
@@ -51,7 +84,14 @@ async function handleSSH(name) {
     ], { stdio: 'inherit' });
 
     ssh.on('exit', code => {
-      console.log(`🔌 Đã thoát khỏi SSH với mã: ${code}`);
+      if (code === 0) {
+        console.log(`🔌 Đã thoát khỏi SSH thành công`);
+      } else {
+        console.log(`🔌 SSH connection failed với mã: ${code}`);
+        if (code === 255) {
+          console.log(`💡 Gợi ý: Kiểm tra lại key file hoặc server có chấp nhận key này không`);
+        }
+      }
       process.exit(code);
     });
     return;
@@ -87,13 +127,26 @@ program
   .version('1.0.0')
   .argument('[name]', 'Tên server để kết nối trực tiếp')
   .action(async (name) => {
-    // Nếu có tên server truyền vào trực tiếp, kết nối luôn
-    if (name) {
-      await handleSSH(name);
-      return;
+    try {
+      let serverName = name;
+      const servers = getServers();
+
+      if (!serverName) {
+        const answer = await inquirer.prompt([
+          {
+            type: 'list',
+            name: 'name',
+            message: 'Chọn server để SSH:',
+            choices: servers.map(s => `${s.name} (${s.user}@${s.host}:${s.port || '22'})`)
+          }
+        ]);
+        serverName = answer.name.split(' ')[0]; // Lấy phần tên trước dấu space
+      }
+
+      await handleSSH(serverName);
+    } catch (e) {
+      program.help()
     }
-    // Nếu không có tham số, hiển thị help
-    program.help();
   });
 
 program
@@ -169,6 +222,9 @@ program
           console.log('⚠️ Không thể set quyền 600 cho file key');
         }
         
+        // Save key content to credentials for regeneration
+        await saveKeyContent(answers.name, keyContent);
+        
         server.keyPath = `~/.sshm/keys/${answers.name}_key`;
       } else if (answers.keyMethod === 'file') {
         // Lưu đường dẫn với ~/
@@ -196,7 +252,7 @@ program
   });
 
 program
-  .command('list')
+  .command('ls')
   .description('Liệt kê danh sách server')
   .action(() => {
     const servers = getServers();
@@ -213,7 +269,7 @@ program
   });
 
 program
-  .command('remove [name]')
+  .command('rm [name]')
   .description('Xóa server theo tên (nếu không truyền sẽ hiển thị menu)')
   .action(async (name) => {
     const servers = getServers();
@@ -270,6 +326,63 @@ program
     }
 
     await handleSSH(targetName);
+  });
+
+program
+  .command('regen [name]')
+  .description('Tái tạo key file từ content đã lưu')
+  .action(async (nameArg) => {
+    const servers = getServers();
+    const keyServers = servers.filter(s => s.keyPath);
+    
+    if (keyServers.length === 0) return console.log('⚠️ Không có server nào sử dụng SSH key.');
+    
+    let targetName = nameArg;
+    if (!targetName) {
+      const answer = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'name',
+          message: 'Chọn server để tái tạo key:',
+          choices: keyServers.map(s => `${s.name} (${s.user}@${s.host})`)
+        }
+      ]);
+      targetName = answer.name.split(' ')[0]; // Lấy phần tên trước dấu space
+    }
+    
+    try {
+      await regenerateKeyFile(targetName);
+      console.log(`✅ Đã tái tạo key file cho server "${targetName}"`);
+    } catch (error) {
+      console.log(`⚠️ ${error.message}`);
+    }
+  });
+
+program
+  .command('regen-all')
+  .description('Tái tạo tất cả key files từ content đã lưu (dùng khi thư mục keys bị xóa)')
+  .action(async () => {
+    console.log('🔄 Đang tái tạo tất cả key files...');
+    const results = await regenerateAllKeyFiles();
+    
+    if (results.length === 0) {
+      console.log('ℹ️ Không có key nào để tái tạo.');
+      return;
+    }
+    
+    const successCount = results.filter(r => r.status === 'success').length;
+    const failedCount = results.filter(r => r.status === 'failed').length;
+    
+    console.log(`\n📊 Kết quả tái tạo:`);
+    console.log(`✅ Thành công: ${successCount}`);
+    console.log(`❌ Thất bại: ${failedCount}`);
+    
+    if (failedCount > 0) {
+      console.log('\n⚠️ Các key thất bại:');
+      results.filter(r => r.status === 'failed').forEach(r => {
+        console.log(`  - ${r.name}: ${r.reason}`);
+      });
+    }
   });
 
 program.parseAsync();
