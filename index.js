@@ -4,15 +4,15 @@
  *
  * Usage:
  *   sshm add
- *   sshm list
- *   sshm remove <alias>
+ *   sshm ls
+ *   sshm rm [alias]
  *   sshm connect <alias>
  *   sshm <alias>
  *
  * Notes:
  *  - Requires: ssh available in PATH
- *  - Uses keytar to store passwords securely in OS keyring
- *  - Uses node-pty to spawn a pty and detect password prompts, host key prompts
+ *  - Stores credentials in the OS keyring
+ *  - Uses the system SSH client and OpenSSH host key verification.
  */
 
 import { Command } from 'commander';
@@ -21,9 +21,11 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { getServers, saveServers, savePassword, getPassword, deletePassword, saveKeyContent, regenerateKeyFile, regenerateAllKeyFiles } from './lib/store.js';
+import { getServers, saveServers, savePassword, getPassword, deleteCredential, saveKeyContent, regenerateKeyFile, regenerateAllKeyFiles } from './lib/store.js';
 
 // Check if sshpass is available
+const SAFE_SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 function checkSshpass() {
   return new Promise((resolve) => {
     const check = spawn('which', ['sshpass'], { stdio: 'ignore' });
@@ -86,13 +88,15 @@ async function handleSSH(name) {
     console.log(`🔐 Đang kết nối bằng SSH key tới ${server.user}@${server.host}:${server.port}...`);
     // console.log(`🔑 Sử dụng SSH key: ${keyPath}`);
     const ssh = spawn('ssh', [
-      '-o', 'StrictHostKeyChecking=no',
-      '-o', 'UserKnownHostsFile=/dev/null',
-      '-o', 'LogLevel=ERROR',
       '-p', server.port,
       '-i', keyPath,
       `${server.user}@${server.host}`
     ], { stdio: 'inherit' });
+
+    ssh.on('error', error => {
+      console.error(`❌ Không thể khởi chạy ssh: ${error.message}`);
+      process.exitCode = 1;
+    });
 
     ssh.on('exit', code => {
       if (code === 0) {
@@ -103,7 +107,7 @@ async function handleSSH(name) {
           console.log(`💡 Gợi ý: Kiểm tra lại key file hoặc server có chấp nhận key này không`);
         }
       }
-      process.exit(code);
+      process.exitCode = code === null ? 1 : code;
     });
     return;
   }
@@ -126,16 +130,14 @@ async function handleSSH(name) {
   
   try {
     const sshPassProc = spawn('sshpass', [
-      '-p', password,
+      '-d', '3',
       'ssh',
-      '-o', 'StrictHostKeyChecking=no',
-      '-o', 'UserKnownHostsFile=/dev/null',
-      '-o', 'LogLevel=ERROR',
       '-p', server.port,
       `${server.user}@${server.host}`
     ], {
-      stdio: 'inherit'
+      stdio: ['inherit', 'inherit', 'inherit', 'pipe']
     });
+    sshPassProc.stdio[3].end(password);
 
     sshPassProc.on('error', (error) => {
       if (error.code === 'ENOENT') {
@@ -147,7 +149,7 @@ async function handleSSH(name) {
       } else {
         console.log(`❌ Lỗi SSH: ${error.message}`);
       }
-      process.exit(1);
+      process.exitCode = 1;
     });
 
     sshPassProc.on('exit', code => {
@@ -159,11 +161,11 @@ async function handleSSH(name) {
           console.log(`💡 Gợi ý: Kiểm tra lại thông tin server hoặc password`);
         }
       }
-      process.exit(code);
+      process.exitCode = code === null ? 1 : code;
     });
   } catch (error) {
     console.log(`❌ Lỗi khi khởi tạo SSH: ${error.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
@@ -178,6 +180,7 @@ program
     try {
       let serverName = name;
       const servers = getServers();
+      if (servers.length === 0) return console.log('⚠️ Chưa có server nào. Hãy chạy sshm add.');
 
       if (!serverName) {
         const answer = await inquirer.prompt([
@@ -193,7 +196,8 @@ program
 
       await handleSSH(serverName);
     } catch (e) {
-      program.help()
+      console.error(`❌ ${e.message}`);
+      process.exitCode = 1;
     }
   });
 
@@ -232,12 +236,35 @@ program
     ]);
 
     const servers = getServers();
-    const server = {
-      name: answers.name,
-      host: answers.host,
-      user: answers.user,
-      port: answers.port || '22'
-    };
+    const name = (answers.name || '').trim();
+    const host = (answers.host || '').trim();
+    const user = (answers.user || '').trim();
+    const port = String(answers.port || '22').trim();
+    if (!SAFE_SERVER_NAME.test(name)) {
+      console.log('⚠️ Tên server chỉ được gồm chữ, số, dấu chấm, gạch ngang hoặc gạch dưới (tối đa 64 ký tự).');
+      return;
+    }
+    if (!host || /^-/.test(host) || /[@\s]/.test(host)) {
+      console.log('⚠️ Host không hợp lệ. Không dùng khoảng trắng, @ hoặc bắt đầu bằng dấu gạch ngang.');
+      return;
+    }
+    if (!user || /^-/.test(user) || /[@\s]/.test(user)) {
+      console.log('⚠️ Username SSH không hợp lệ.');
+      return;
+    }
+    if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+      console.log('⚠️ Port phải nằm trong khoảng 1–65535.');
+      return;
+    }
+    if (servers.some(s => s.name === name)) {
+      console.log(`⚠️ Server "${name}" đã tồn tại.`);
+      return;
+    }
+    answers.name = name;
+    answers.host = host;
+    answers.user = user;
+    answers.port = port;
+    const server = { name, host, user, port };
 
     if (answers.auth === 'key') {
       if (answers.keyMethod === 'paste' && answers.keyContent) {
@@ -246,6 +273,7 @@ program
         if (!fs.existsSync(keysDir)) {
           fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
         }
+        fs.chmodSync(keysDir, 0o700);
         
         const keyFile = path.join(keysDir, `${answers.name}_key`);
         
@@ -339,15 +367,15 @@ program
     saveServers(servers);
 
     // delete password if any
-    try { await deletePassword(removed.name); } catch (e) { /* ignore */ }
+    try { await deleteCredential(removed.name); } catch (e) { console.error(`⚠️ Không thể xóa credential khỏi keyring: ${e.message}`); }
 
     // delete key file if it is inside ~/.sshm/keys
     try {
-      const keysDir = path.join(os.homedir(), '.sshm', 'keys');
-      const fullKeyPath = removed.keyPath ? removed.keyPath.replace(/^~(?=$|\/)/, os.homedir()) : null;
-      if (fullKeyPath && fullKeyPath.startsWith(keysDir) && fs.existsSync(fullKeyPath)) {
-        fs.unlinkSync(fullKeyPath);
-      }
+      const keysDir = path.resolve(os.homedir(), '.sshm', 'keys');
+      const fullKeyPath = removed.keyPath ? path.resolve(removed.keyPath.replace(/^~(?=$|\\/)/, os.homedir())) : null;
+      const relativePath = fullKeyPath ? path.relative(keysDir, fullKeyPath) : '';
+      const isInsideKeysDir = relativePath && relativePath !== '..' && !relativePath.startsWith('..' + path.sep) && !path.isAbsolute(relativePath);
+      if (isInsideKeysDir && fs.existsSync(fullKeyPath)) fs.unlinkSync(fullKeyPath);
     } catch (e) { /* ignore */ }
 
     console.log(`✅ Đã xóa server "${targetName}"`);
@@ -433,4 +461,7 @@ program
     }
   });
 
-program.parseAsync();
+program.parseAsync().catch(error => {
+  console.error(`❌ ${error.message}`);
+  process.exitCode = 1;
+});
